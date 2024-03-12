@@ -137,7 +137,7 @@ use crate::config_bag::typeid_map::TypeIdMap;
 use crate::type_erasure::TypeErasedBox;
 use std::any::{type_name, TypeId};
 use std::borrow::Cow;
-use std::fmt::{Debug, Formatter};
+use std::fmt::{self, Debug, Formatter};
 use std::iter::Rev;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -370,10 +370,9 @@ impl Layer {
     }
 
     /// Inserts `value` into the layer directly
-    fn put_directly<T: Store>(&mut self, value: T::StoredType) -> &mut Self {
+    fn put_directly<T: Store>(&mut self, value: T::StoredType) -> Option<TypeErasedBox> {
         self.props
-            .insert(TypeId::of::<T::StoredType>(), TypeErasedBox::new(value));
-        self
+            .insert(TypeId::of::<T::StoredType>(), TypeErasedBox::new(value))
     }
 
     /// Returns true if this layer is empty.
@@ -415,23 +414,23 @@ impl Layer {
     }
 
     /// Remove `T` from this bag
-    pub fn unset<T: Send + Sync + Debug + 'static>(&mut self) -> &mut Self {
-        self.put_directly::<StoreReplace<T>>(Value::ExplicitlyUnset(type_name::<T>()));
-        self
+    pub fn unset<T: Send + Sync + Debug + 'static>(&mut self) -> UnsetResult<'_> {
+        let value = self.put_directly::<StoreReplace<T>>(Value::ExplicitlyUnset(type_name::<T>()));
+        UnsetResult::new(self, value)
     }
 
     /// Stores `item` of type `T` into the config bag, overriding a previous value of the same type
-    pub fn store_put<T>(&mut self, item: T) -> &mut Self
+    pub fn store_put<T>(&mut self, item: T) -> UnsetResult<'_>
     where
         T: Storable<Storer = StoreReplace<T>>,
     {
-        self.put_directly::<StoreReplace<T>>(Value::Set(item));
-        self
+        let old = self.put_directly::<StoreReplace<T>>(Value::Set(item));
+        UnsetResult::new(self, old)
     }
 
     /// Stores `item` of type `T` into the config bag, overriding a previous value of the same type,
     /// or unsets it by passing a `None`
-    pub fn store_or_unset<T>(&mut self, item: Option<T>) -> &mut Self
+    pub fn store_or_unset<T>(&mut self, item: Option<T>) -> UnsetResult<'_>
     where
         T: Storable<Storer = StoreReplace<T>>,
     {
@@ -439,8 +438,8 @@ impl Layer {
             Some(item) => Value::Set(item),
             None => Value::ExplicitlyUnset(type_name::<T>()),
         };
-        self.put_directly::<StoreReplace<T>>(item);
-        self
+        let old = self.put_directly::<StoreReplace<T>>(item);
+        UnsetResult::new(self, old)
     }
 
     /// This can only be used for types that use [`StoreAppend`]
@@ -513,6 +512,58 @@ impl Layer {
             .or_insert_with(|| TypeErasedBox::new(T::StoredType::default()))
             .downcast_mut()
             .expect("typechecked")
+    }
+}
+
+/// Unset result.
+#[derive(Debug)]
+pub struct UnsetResult<'a> {
+    layer: &'a mut Layer,
+    value: Option<UnsetResultValue>,
+}
+
+impl<'a> UnsetResult<'a> {
+    fn new(layer: &'a mut Layer, value: Option<TypeErasedBox>) -> Self {
+        Self {
+            layer,
+            value: value.map(UnsetResultValue),
+        }
+    }
+
+    /// Decomposes the result into the layer and the value.
+    pub fn into_parts(self) -> (&'a mut Layer, Option<UnsetResultValue>) {
+        (self.layer, self.value)
+    }
+}
+
+impl<'a> std::ops::Deref for UnsetResult<'a> {
+    type Target = Layer;
+
+    fn deref(&self) -> &Self::Target {
+        self.layer
+    }
+}
+
+impl<'a> std::ops::DerefMut for UnsetResult<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.layer
+    }
+}
+
+/// Value part of [`UnsetResult`].
+#[derive(Debug)]
+pub struct UnsetResultValue(TypeErasedBox);
+
+impl UnsetResultValue {
+    /// Downcasts the underlying value to a given type `T`.
+    ///
+    /// This method extracts the mutable reference to the underlying value that
+    /// is wrapped in `Value::Set`.
+    pub fn downcast_mut<T: fmt::Debug + Send + Sync + 'static>(&mut self) -> Option<&mut T> {
+        match self.0.downcast_mut::<Value<T>>() {
+            Some(Value::Set(t)) => Some(t),
+            _ => None,
+        }
     }
 }
 
